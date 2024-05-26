@@ -3,7 +3,8 @@
 //! This module provides structures to define basic information about
 //! provider GPUs.
 
-use serde::Serialize;
+use serde::ser::SerializeMap;
+use serde::{Serialize, Serializer};
 
 /// General information about all gpus.
 #[derive(Clone, Debug, Serialize, Default)]
@@ -12,7 +13,8 @@ pub struct Gpu {
     #[serde(flatten)]
     pub api: GpuApiInfo,
     /// Lists of devices.
-    pub device: Vec<Device>,
+    #[serde(flatten, serialize_with = "ser_devices")]
+    pub devices: Vec<Device>,
 }
 
 /// Available SDKs & device drivers.
@@ -30,6 +32,7 @@ pub struct Cuda {
     pub version: String,
     /// Installed driver version.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "driver.version")]
     pub driver_version: Option<String>,
 }
 
@@ -107,4 +110,16 @@ pub struct DeviceMemory {
     /// Total physical device memory on device in GiB,
     #[serde(rename(serialize = "total.gib"))]
     pub total_gib: f32,
+}
+
+fn ser_devices<S>(devices: &Vec<Device>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut m = s.serialize_map(Some(devices.len()))?;
+    for (idx, dev) in devices.into_iter().enumerate() {
+        m.serialize_key(&format!("d{idx}"))?;
+        m.serialize_value(dev)?;
+    }
+    m.end()
 }

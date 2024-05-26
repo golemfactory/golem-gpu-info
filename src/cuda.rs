@@ -117,7 +117,6 @@ fn memory(dev: &Device, flags: &Flags) -> Result<DeviceMemory, NvmlError> {
     })
 }
 
-/// Unused because of lack of `memTransferRatemax` property.
 fn bandwidth_gib(dev: &Device) -> Result<Option<u32>, NvmlError> {
     let memory_bus_width = dev.memory_bus_width()?;
     let max_memory_clock = dev.max_clock_info(Clock::Memory)?;
@@ -139,7 +138,7 @@ impl Platform for CudaPlatform {
     }
 
     fn init(&self, flags: Flags) -> crate::Result<Box<dyn Detection>> {
-        let nvml = match Nvml::init() {
+        let nvml = match nvml_init() {
             Ok(nvlm) => nvlm,
             Err(NvmlError::LibloadingError(e)) => {
                 return if flags.force {
@@ -152,6 +151,25 @@ impl Platform for CudaPlatform {
         };
         Ok(Box::new(CudaDetection { nvml, flags }))
     }
+}
+
+// On systems without a full development environment there may not
+// be `libnvidia-ml.so`. Because there is a convention to name `lib<name>.so.<version>` files
+// as runtime lib.
+#[cfg(target_os = "linux")]
+fn nvml_init() -> std::result::Result<Nvml, NvmlError> {
+    match Nvml::init() {
+        Err(NvmlError::LibraryNotFound) => Nvml::builder()
+            .lib_path("libnvidia-ml.so.1".as_ref())
+            .init(),
+        r => r,
+    }
+}
+
+// on windows default `libnvidia-ml.dll` is ok.
+#[cfg(not(target_os = "linux"))]
+fn nvml_init() -> std::result::Result<Nvml, NvmlError> {
+    Nvml::init()
 }
 
 static CUDA_PLATFORM: CudaPlatform = CudaPlatform;

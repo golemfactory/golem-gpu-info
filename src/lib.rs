@@ -138,7 +138,7 @@ impl GpuDetection {
     /// Detects all available GPUs..
     pub fn detect(&self) -> Result<Gpu> {
         let mut api = Default::default();
-        let mut device = Vec::new();
+        let mut devices = Vec::new();
 
         for detector in &self.detections {
             detector.detect_api(&mut api)?;
@@ -154,14 +154,14 @@ impl GpuDetection {
                     {
                         dev.quantity += 1;
                     } else {
-                        device.push(mem::replace(&mut dev, next_dev));
+                        devices.push(mem::replace(&mut dev, next_dev));
                     }
                 }
-                device.push(dev);
+                devices.push(dev);
             }
         }
 
-        Ok(Gpu { api, device })
+        Ok(Gpu { api, devices })
     }
 
     /// Finds single device by uuid.
@@ -207,7 +207,12 @@ mod test {
     }
 
     impl Detection for TestPlatformDetection {
-        fn detect_api(&self, _api: &mut GpuApiInfo) -> crate::Result<()> {
+        fn detect_api(&self, api: &mut GpuApiInfo) -> crate::Result<()> {
+            api.cuda = model::Cuda {
+                version: "12.2".into(),
+                driver_version: Some("535.146.02".into()),
+            }
+            .into();
             Ok(())
         }
 
@@ -220,9 +225,8 @@ mod test {
         }
     }
 
-    #[test]
-    fn test_aggregation() {
-        let gpu = Device {
+    fn gen_rtx_3090() -> Device {
+        Device {
             model: "NVIDIA GeForce RTX 3090".to_string(),
             cuda: model::DeviceCuda {
                 enabled: true,
@@ -241,9 +245,13 @@ mod test {
                 total_gib: 24.0,
             },
             quantity: 1,
-        };
+        }
+    }
+
+    #[test]
+    fn test_aggregation() {
         let platform: Box<dyn Platform> = Box::new(TestPlatformDetection {
-            devices: vec![gpu.clone(), gpu.clone()],
+            devices: vec![gen_rtx_3090(), gen_rtx_3090()],
         });
 
         let mut b = super::GpuDetectionBuilder::default();
@@ -254,8 +262,10 @@ mod test {
             .detect()
             .expect("mock detection");
 
-        assert_eq!(gpu.device.len(), 1);
-        let dev = gpu.device.first().unwrap();
+        assert_eq!(gpu.devices.len(), 1);
+        let dev = gpu.devices.first().unwrap();
         assert_eq!(dev.quantity, 2);
+
+        //eprintln!("{}", serde_json::to_string_pretty(&gpu).unwrap());
     }
 }
