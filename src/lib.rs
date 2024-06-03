@@ -1,147 +1,271 @@
-use model::{Clocks, Cuda, Gpu, Memory};
-use nvml_wrapper::error::NvmlError;
-use nvml_wrapper::{enum_wrappers::device::Clock, Device, Nvml};
-use thiserror::Error;
+#![deny(missing_docs)]
+#![forbid(unsafe_code)]
+//! GPU Device detection and offer builder.
 
 pub mod model;
 
-#[derive(Error, Debug)]
-pub enum GpuDetectionError {
-    #[error("libloading error occurred: {0}")]
-    LibloadingError(#[from] libloading::Error),
-    #[error("Failed to access GPU error: {0}")]
-    GpuAccessError(String),
-    #[error("Failed to access GPU info error: {0}")]
-    GpuInfoAccessError(String),
-    #[error("NVML error occurred: {0}")]
-    Unknown(String),
+#[cfg(feature = "amd")]
+mod amd;
+#[cfg(not(feature = "amd"))]
+mod amd {
+    #[derive(thiserror::Error, Debug)]
+    #[error("AMD never")]
+    pub struct AmdError {
+        _inner: (),
+    }
 }
 
+#[cfg(feature = "cuda")]
+mod cuda;
+mod platform;
+
+use crate::model::Device;
+use crate::platform::{Detection, Flags, Platform};
+pub use model::Gpu;
+use static_assertions::*;
+use std::collections::BTreeSet;
+use std::mem;
+use std::result::Result as StdResult;
+use thiserror::Error;
+
+/// Errors
+#[derive(Error, Debug)]
+pub enum GpuDetectionError {
+    /// Failed to load GPU driver.
+    #[error("libloading error occurred: {0}")]
+    LibloadingError(#[from] libloading::Error),
+
+    /// Failed to attach to device
+    #[error("Failed to access GPU error: {0}")]
+    GpuAccessError(String),
+
+    /// Problem with reading device properties.
+    #[error("Failed to access GPU info error: {0}")]
+    GpuInfoAccessError(String),
+
+    /// Other driver errors.
+    #[error("NVML error occurred: {0}")]
+    Unknown(String),
+
+    /// Required driver not found.
+    #[error("Driver not found")]
+    NotFound,
+
+    /// Amd driver error
+    #[error(transparent)]
+    AmdError(#[from] amd::AmdError),
+}
+
+type Result<T> = StdResult<T, GpuDetectionError>;
+
+/// Initialize device discovery backends.
+pub struct GpuDetectionBuilder {
+    force: BTreeSet<&'static str>,
+    unstable: bool,
+
+    platforms: Vec<&'static dyn Platform>,
+}
+
+impl Default for GpuDetectionBuilder {
+    fn default() -> Self {
+        let force = Default::default();
+        let unstable = false;
+        let platforms = vec![
+            #[cfg(feature = "cuda")]
+            cuda::platform(),
+            #[cfg(feature = "amd")]
+            amd::platform(),
+        ];
+        Self {
+            force,
+            unstable,
+            platforms,
+        }
+    }
+}
+
+/// Device detection service.
 pub struct GpuDetection {
-    nvml: Nvml,
+    detections: Vec<Box<dyn Detection>>,
+}
+
+assert_impl_all!(GpuDetection: Send, Sync);
+
+impl GpuDetectionBuilder {
+    /// Queries about devices will result in an error if
+    /// NVIDIA Management Library is not available in the current environment.
+    pub fn force_cuda(mut self) -> Self {
+        self.force.insert("cuda");
+        self
+    }
+
+    /// Queries may return information about which we are not certain.
+    pub fn unstable_props(mut self) -> Self {
+        self.unstable = true;
+        self
+    }
+
+    /// Initializes backends.
+    pub fn init(mut self) -> Result<GpuDetection> {
+        let detections = self
+            .platforms
+            .into_iter()
+            .filter_map(|platform| {
+                let force = self.force.remove(platform.name());
+                match platform.init(Flags {
+                    unstable: self.unstable,
+                    force,
+                }) {
+                    Ok(v) => Some(Ok(v)),
+                    Err(e) if force => Some(Err(e)),
+                    // skip error if not forced.
+                    _ => None,
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if !self.force.is_empty() {
+            return Err(GpuDetectionError::GpuAccessError(format!(
+                "missing forced platforms: {:?}",
+                self.force
+            )));
+        }
+        Ok(GpuDetection { detections })
+    }
 }
 
 impl GpuDetection {
-    pub fn init() -> Result<Self, GpuDetectionError> {
-        let nvml = match Nvml::init() {
-            Ok(nvlm) => nvlm,
-            Err(NvmlError::LibloadingError(e)) => {
-                return Err(GpuDetectionError::LibloadingError(e))
+    /// Detects all available GPUs..
+    pub fn detect(&self) -> Result<Gpu> {
+        let mut api = Default::default();
+        let mut devices = Vec::new();
+
+        for detector in &self.detections {
+            detector.detect_api(&mut api)?;
+
+            let mut it = detector.devices()?.into_iter();
+            if let Some(mut dev) = it.next() {
+                for next_dev in it {
+                    //while let Some(next_dev) = it.next() {
+                    if next_dev.model == dev.model
+                        && next_dev.cuda == dev.cuda
+                        && next_dev.clocks == dev.clocks
+                        && next_dev.memory == dev.memory
+                    {
+                        dev.quantity += 1;
+                    } else {
+                        devices.push(mem::replace(&mut dev, next_dev));
+                    }
+                }
+                devices.push(dev);
             }
-            Err(e) => return Err(GpuDetectionError::Unknown(e.to_string())),
-        };
-        Ok(Self { nvml })
-    }
-
-    /// `uuid` of GPU device. If not provided first available GPU device will be used.
-    pub fn detect<S: AsRef<str>>(&self, uuid: Option<S>) -> Result<Gpu, GpuDetectionError> {
-        if let Some(uuid) = uuid {
-            let dev = self.nvml.device_by_uuid(uuid.as_ref()).map_err(|err| {
-                GpuDetectionError::GpuAccessError(format!(
-                    "Failed to get GPU device with UUID: {}. Err {}",
-                    uuid.as_ref(),
-                    err
-                ))
-            })?;
-            return self
-                .device_info(dev)
-                .map_err(|err| GpuDetectionError::GpuInfoAccessError(err.to_string()));
-        };
-
-        let gpu_count = self.nvml.device_count().map_err(|err| {
-            GpuDetectionError::Unknown(format!("Failed to get device count. Err {}", err))
-        })?;
-
-        if gpu_count == 0 {
-            return Err(GpuDetectionError::GpuAccessError("No GPU available".into()));
         }
 
-        let index = 0;
-        let dev = self.nvml.device_by_index(index).map_err(|err| {
-            GpuDetectionError::GpuAccessError(format!(
-                "Failed to get GPU device under index: {}. Err {}",
-                index, err
-            ))
-        })?;
-
-        self.device_info(dev)
-            .map_err(|err| GpuDetectionError::GpuInfoAccessError(err.to_string()))
+        Ok(Gpu { api, devices })
     }
 
-    fn device_info(&self, dev: Device) -> Result<Gpu, NvmlError> {
-        let model = dev.name()?;
-        let version = self.cuda_version()?;
-        let cuda = cuda(&dev, version)?;
-        let clocks = clocks(&dev)?;
-        let memory = memory(&dev)?;
-        Ok(Gpu {
-            model,
-            cuda,
-            clocks,
-            memory,
-        })
-    }
-
-    fn cuda_version(&self) -> Result<String, NvmlError> {
-        let version = self.nvml.sys_cuda_driver_version()?;
-        let version_major = nvml_wrapper::cuda_driver_version_major(version);
-        let version_minor = nvml_wrapper::cuda_driver_version_minor(version);
-        Ok(format!("{}.{}", version_major, version_minor))
+    /// Finds single device by uuid.
+    pub fn search_by_uuid(&self, uuid: &str) -> Result<Device> {
+        let mut last_err = None;
+        for detector in &self.detections {
+            match detector.device_by_uuid(uuid) {
+                Ok(Some(device)) => return Ok(device),
+                Err(e) => {
+                    last_err = Some(e);
+                }
+                _ => (),
+            }
+        }
+        Err(last_err.unwrap_or(GpuDetectionError::NotFound))
     }
 }
 
-fn cuda(dev: &Device, version: String) -> Result<Cuda, NvmlError> {
-    let enabled = true;
-    let cores = dev.num_cores()?;
-    let compute_capability = compute_capability(dev)?;
-    Ok(Cuda {
-        enabled,
-        cores,
-        version,
-        compute_capability,
-    })
-}
-
-fn compute_capability(dev: &Device) -> Result<String, NvmlError> {
-    let capability = dev.cuda_compute_capability()?;
-    Ok(format!("{}.{}", capability.major, capability.minor))
-}
-
-fn clocks(dev: &Device) -> Result<Clocks, NvmlError> {
-    let graphics_mhz = dev.max_clock_info(Clock::Graphics)?;
-    let memory_mhz = dev.max_clock_info(Clock::Memory)?;
-    let sm_mhz = dev.max_clock_info(Clock::SM)?;
-    let video_mhz = dev.max_clock_info(Clock::Video)?;
-    Ok(Clocks {
-        graphics_mhz,
-        memory_mhz,
-        sm_mhz,
-        video_mhz,
-    })
-}
-
-fn memory(dev: &Device) -> Result<Memory, NvmlError> {
-    let total_bytes = dev.memory_info()?.total;
-    let total_gib = bytes_to_gib(total_bytes);
-    Ok(Memory {
-        bandwidth_gib: None,
-        total_gib,
-    })
-}
-
-/// Unused because of lack of `memTransferRatemax` property.
-#[allow(dead_code)]
-fn bandwidth_gib(dev: &Device) -> Result<u32, NvmlError> {
-    let memory_bus_width = dev.memory_bus_width()?;
-    let supported_memory_clocks = dev.supported_memory_clocks()?;
-    let max_memory_clock = supported_memory_clocks.iter().cloned().fold(0, u32::max);
-    // `nvml` does not provide `memTransferRatemax` like `nvidia-settings` tool does.
-    // Transfer rate is a result of memory clock, bus width, and memory specific multiplier (for DDR it is 2)
-    let data_rate = 2; // value for DDR
-    let bandwidth_gib = max_memory_clock * memory_bus_width * data_rate / (1000 * 8);
-    Ok(bandwidth_gib)
-}
-
+#[cfg(any(feature = "cuda", feature = "amd"))]
 fn bytes_to_gib(memory: u64) -> f32 {
     (memory as f64 / 1024.0 / 1024.0 / 1024.0) as f32
+}
+
+#[cfg(test)]
+mod test {
+    use crate::model;
+    use crate::model::{Device, GpuApiInfo};
+    use crate::platform::{Detection, Flags, Platform};
+
+    #[derive(Clone)]
+    struct TestPlatformDetection {
+        devices: Vec<Device>,
+    }
+
+    impl Platform for TestPlatformDetection {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn init(&self, _flags: Flags) -> crate::Result<Box<dyn Detection>> {
+            Ok(Box::new(self.clone()))
+        }
+    }
+
+    impl Detection for TestPlatformDetection {
+        fn detect_api(&self, api: &mut GpuApiInfo) -> crate::Result<()> {
+            api.cuda = model::Cuda {
+                version: "12.2".into(),
+                driver_version: Some("535.146.02".into()),
+            }
+            .into();
+            Ok(())
+        }
+
+        fn devices(&self) -> crate::Result<Vec<Device>> {
+            Ok(self.devices.clone())
+        }
+
+        fn device_by_uuid(&self, _uuid: &str) -> crate::Result<Option<Device>> {
+            Ok(None)
+        }
+    }
+
+    fn gen_rtx_3090() -> Device {
+        Device {
+            model: "NVIDIA GeForce RTX 3090".to_string(),
+            cuda: model::DeviceCuda {
+                enabled: true,
+                cores: 10496,
+                caps: "8.6".to_string(),
+            }
+            .into(),
+            clocks: model::DeviceClocks {
+                graphics_mhz: 2100,
+                memory_mhz: 9751,
+                sm_mhz: 2100,
+                video_mhz: 1950.into(),
+            },
+            memory: model::DeviceMemory {
+                bandwidth_gib: 936.into(),
+                total_gib: 24.0,
+            },
+            quantity: 1,
+        }
+    }
+
+    #[test]
+    fn test_aggregation() {
+        let platform: Box<dyn Platform> = Box::new(TestPlatformDetection {
+            devices: vec![gen_rtx_3090(), gen_rtx_3090()],
+        });
+
+        let mut b = super::GpuDetectionBuilder::default();
+        b.platforms = vec![Box::leak(platform)];
+        let gpu = b
+            .init()
+            .expect("failed to initialize")
+            .detect()
+            .expect("mock detection");
+
+        assert_eq!(gpu.devices.len(), 1);
+        let dev = gpu.devices.first().unwrap();
+        assert_eq!(dev.quantity, 2);
+
+        //eprintln!("{}", serde_json::to_string_pretty(&gpu).unwrap());
+    }
 }
